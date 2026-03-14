@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  video-parser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: video-parser
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "5001:5001"
+      - "7860:7860"
+    volumes:
+      - ./static/videos:/app/static/videos
+      - ./static/images:/app/static/images
+      - ./downloads:/app/downloads
+      - ./cache:/app/cache
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_USER=${DB_USER:-video_parser}
+      - DB_PASSWORD=${DB_PASSWORD:-video_parser_password}
+      - DB_NAME=${DB_NAME:-ucmao_parse}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - video-parser-network
+
+  mysql:
+    image: mysql:8.0
+    container_name: video-parser-mysql
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-root_password}
+      - MYSQL_DATABASE=${DB_NAME:-ucmao_parse}
+      - MYSQL_USER=${DB_USER:-video_parser}
+      - MYSQL_PASSWORD=${DB_PASSWORD:-video_parser_password}
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_general_ci
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks:
+      - video-parser-network
+
+networks:
+  video-parser-network:
+    driver: bridge
+
+volumes:
+  mysql_data:
