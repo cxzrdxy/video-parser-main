@@ -6,8 +6,10 @@
 
 import os
 import time
+import asyncio
 from typing import Optional
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -144,6 +146,12 @@ def validate_request_headers(
     return None
 
 
+# ==================== 线程池配置 ====================
+
+# 创建线程池执行器，用于执行同步下载任务
+download_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="download_worker")
+
+
 # ==================== 应用生命周期 ====================
 
 @asynccontextmanager
@@ -156,6 +164,9 @@ async def lifespan(app: FastAPI):
     yield
     # 关闭时执行
     logger.info("Shutting down Video Parser API Service...")
+    # 关闭线程池
+    download_executor.shutdown(wait=True)
+    logger.info("Download executor shutdown complete")
 
 
 # ==================== 创建 FastAPI 应用 ====================
@@ -454,6 +465,57 @@ async def parse_video(
         )
 
 
+def sync_download_video(request_video_url: str, video_path: str, wx_open_id: str) -> dict:
+    """
+    同步下载视频的函数，在线程池中执行
+
+    Returns:
+        dict: {'success': bool, 'error_msg': str or None}
+    """
+    logger.info(f"[Thread] Starting download for {request_video_url}")
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        'Referer': 'https://www.pearvideo.com/'
+    }
+
+    # 如果是梨视频，必须带 Referer
+    if "pearvideo.com" in request_video_url:
+        headers['Referer'] = 'https://www.pearvideo.com/'
+
+    # 创建带重试机制的session
+    session = requests.Session()
+    retries = Retry(
+        total=5,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    session.mount('http://', HTTPAdapter(max_retries=retries))
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+
+    try:
+        response = session.get(request_video_url, headers=headers, stream=True, timeout=120)
+        response.raise_for_status()
+    except (RequestException, ConnectionError) as e:
+        logger.error(f'{wx_open_id} Failed to connect: {e}')
+        return {'success': False, 'error_msg': 'connect_failed'}
+
+    try:
+        # 保存视频到服务器
+        with open(video_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        logger.info(f"[Thread] Download completed: {video_path}")
+        return {'success': True, 'error_msg': None}
+    except (ChunkedEncodingError, IOError) as e:
+        logger.error(f'{wx_open_id} Failed to save video: {e}')
+        # 删除可能不完整的文件
+        if os.path.exists(video_path):
+            os.remove(video_path)
+        return {'success': False, 'error_msg': 'save_failed'}
+
+
 @app.post("/api/download")
 async def download_video(
     body: DownloadRequest,
@@ -466,6 +528,7 @@ async def download_video(
     获取视频下载链接
 
     对于某些平台，需要服务器端下载并返回可访问的链接
+    使用线程池执行同步下载任务，避免阻塞事件循环
     """
     try:
         request_video_url = body.video_url
@@ -496,51 +559,22 @@ async def download_video(
             current_domain = DOMAIN or "http://localhost:5001"
 
             if not os.path.exists(video_path):
-                logger.info(f"Starting server-side download for {request_video_url}")
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-                    'Referer': 'https://www.pearvideo.com/'
-                }
-
-                # 如果是梨视频，必须带 Referer
-                if "pearvideo.com" in request_video_url:
-                    headers['Referer'] = 'https://www.pearvideo.com/'
-
-                # 创建带重试机制的session
-                session = requests.Session()
-                retries = Retry(
-                    total=5,
-                    backoff_factor=1,
-                    status_forcelist=[500, 502, 503, 504],
-                    allowed_methods=["GET"]
+                # 使用线程池执行同步下载任务
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    download_executor,
+                    sync_download_video,
+                    request_video_url,
+                    video_path,
+                    wx_open_id
                 )
-                session.mount('http://', HTTPAdapter(max_retries=retries))
-                session.mount('https://', HTTPAdapter(max_retries=retries))
 
-                try:
-                    response = session.get(request_video_url, headers=headers, stream=True, timeout=120)
-                    response.raise_for_status()
-                except (RequestException, ConnectionError) as e:
-                    logger.error(f'{wx_open_id} Failed to connect: {e}')
+                if not result['success']:
+                    # 下载失败，返回原始链接
+                    error_msg = '服务器下载失败，返回原始链接'
                     return JSONResponse(
                         status_code=200,
-                        content=make_response(200, '服务器下载失败，返回原始链接', {'download_url': request_video_url}, None, True)
-                    )
-
-                try:
-                    # 保存视频到服务器
-                    with open(video_path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
-                except (ChunkedEncodingError, IOError) as e:
-                    logger.error(f'{wx_open_id} Failed to save video: {e}')
-                    # 删除可能不完整的文件
-                    if os.path.exists(video_path):
-                        os.remove(video_path)
-                    return JSONResponse(
-                        status_code=200,
-                        content=make_response(200, '服务器下载失败，返回原始链接', {'download_url': request_video_url}, None, True)
+                        content=make_response(200, error_msg, {'download_url': request_video_url}, None, True)
                     )
 
             # 返回视频的 URL

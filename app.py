@@ -986,7 +986,11 @@ def create_app():
 
 if __name__ == "__main__":
     app = create_app()
-    app.launch(
+    app.queue(
+        concurrency_count=3,
+        max_size=20,
+        status_update_rate=1
+    ).launch(
         server_name="0.0.0.0",
         server_port=7860,
         share=False,
